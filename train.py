@@ -79,6 +79,8 @@ def main():
 
         if step == 500:
             break
-
+    # final checkpoint
+    torch.save(model.state_dict(), "ckpt_final.pt")
+    print("Saved ckpt_final.pt")
 if __name__ == "__main__":
     main()
