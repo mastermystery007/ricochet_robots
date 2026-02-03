@@ -1,4 +1,3 @@
-# data.py
 import random
 import numpy as np
 import torch
@@ -6,11 +5,13 @@ from torch.utils.data import Dataset
 
 DMAX = 20  # bin 20 means >=20
 
-# Must match environment.py constants
-NORTH, EAST, SOUTH, WEST = 1, 2, 4, 8
-DIRS = {NORTH: (-1, 0), EAST: (0, 1), SOUTH: (1, 0), WEST: (0, -1)}
-DIR_LIST = [NORTH, EAST, SOUTH, WEST]
-
+# direction index: 0=N,1=E,2=S,3=W
+DRDC = {
+    0: (-1, 0),
+    1: (0, +1),
+    2: (+1, 0),
+    3: (0, -1),
+}
 
 def cell_id(r, c, size=16):
     return int(r) * size + int(c)
@@ -18,64 +19,44 @@ def cell_id(r, c, size=16):
 def action_robot_id(a):
     return a // 4
 
-def action_dir(a):
-    return DIR_LIST[a % 4]
-
-def blocked_by_wall(walls, r, c, direction):
-    return (int(walls[r, c]) & int(direction)) != 0
-
-
-def slide_and_get_stopper(walls, state_rc, robot_id, direction, size=16):
-    """
-    Pure transition (no env mutation) that also returns which robot stopped the slide.
-    stopper_id:
-      - None if wall/bounds stopped it
-      - int robot_id if another robot blocked
-    """
-    dr, dc = DIRS[direction]
-    r, c = int(state_rc[robot_id, 0]), int(state_rc[robot_id, 1])
-
-    occ = {(int(rr), int(cc)) for rr, cc in state_rc}
-    occ.remove((r, c))
-
-    stopper = None
-    while True:
-        # wall blocks leaving current cell
-        if blocked_by_wall(walls, r, c, direction):
-            stopper = None
-            break
-
-        nr, nc = r + dr, c + dc
-        if not (0 <= nr < size and 0 <= nc < size):
-            stopper = None
-            break
-
-        if (nr, nc) in occ:
-            # stopped by another robot
-            # identify which robot is at (nr,nc)
-            for rid in range(state_rc.shape[0]):
-                if rid == robot_id:
-                    continue
-                if int(state_rc[rid, 0]) == nr and int(state_rc[rid, 1]) == nc:
-                    stopper = rid
-                    break
-            break
-
-        # move
-        r, c = nr, nc
-
-    next_state = state_rc.copy()
-    moved = not (r == int(next_state[robot_id, 0]) and c == int(next_state[robot_id, 1]))
-    next_state[robot_id] = (r, c)
-    return next_state, moved, stopper
+def action_dir_idx(a):
+    return a % 4
 
 
 class HindsightDataset(Dataset):
-    def __init__(self, env, num_episodes=1000, rollout_len=15, pairs_per_episode=6, grid_size=16):
+    """
+    PV training dataset:
+      - walls
+      - robots_a = state at time i
+      - robots_b = state at time j   (verifier supervision)
+      - goal = (target_robot, r_goal, c_goal) where (r_goal,c_goal) taken from robots_b[target_robot]
+      - mid_cell = target robot cell at midpoint k = floor((i+j)/2)
+      - helper/blocker robot id and its cell at FIRST interaction with target (if any)
+      - dist bin = min(j-i, 20)
+
+    Key change: supports COMPLETE SUBSETS (all i<j) when pairs_per_episode=None.
+    Key change: helper chosen by “most interactions blocking target”.
+    """
+    def __init__(
+        self,
+        env,
+        num_episodes=1000,
+        rollout_len=15,
+        pairs_per_episode=None,          # None => ALL PAIRS
+        grid_size=16,
+        include_all_one_step=True,       # extra 1-step segments
+        max_pairs_cap=None               # optional safety cap per episode
+    ):
         self.env = env
         self.grid_size = grid_size
         self.data = []
-        self._generate_data(num_episodes, rollout_len, pairs_per_episode)
+        self._generate_data(
+            num_episodes=num_episodes,
+            rollout_len=rollout_len,
+            pairs_per_episode=pairs_per_episode,
+            include_all_one_step=include_all_one_step,
+            max_pairs_cap=max_pairs_cap,
+        )
 
     def _random_walk_episode(self, steps=15):
         states = [self.env.get_state()]
@@ -92,73 +73,100 @@ class HindsightDataset(Dataset):
                 break
         return states, actions
 
-    def _choose_helper_by_interaction(self, walls, s_i, actions_segment, target_robot, size=16):
+    def _helper_by_interaction(self, states, actions, i, j, target_robot):
         """
-        Helper = robot that most often blocks the target robot during target moves
-        in this segment. Also returns helper_cell_label = helper position at first
-        such interaction time-step (in trajectory time, before applying that action).
-
-        Returns: (helper_id, helper_cell_id, found_interaction_bool)
+        Interaction definition (v1, reliable from (state,action) logs):
+        - Consider each step t in [i, j-1]
+        - If action at t moves the TARGET robot in direction dir,
+          then the target stops either due to wall or due to another robot.
+        - We infer "blocked by robot X" if the cell immediately in front of the
+          target's final position (in that direction) is occupied by some robot in state_before.
+        - Count blockers; choose the most frequent blocker as helper.
+        - Helper position label = helper's position at the FIRST blocking event.
         """
-        interaction_counts = [0, 0, 0, 0]
-        first_helper_cell = None
-        first_helper_id = None
+        counts = [0, 0, 0, 0]
+        first_block_pos = [None, None, None, None]  # store (r,c) when first blocks
 
-        # simulate forward from s_i applying the actions in the segment
-        state = s_i.copy()
-
-        for a in actions_segment:
+        for t in range(i, j):
+            if t >= len(actions):
+                break
+            a = int(actions[t])
             rid = action_robot_id(a)
-            direction = action_dir(a)
+            if rid != target_robot:
+                continue
 
-            if rid == target_robot:
-                # Before applying the move, see who would stop it
-                next_state, moved, stopper = slide_and_get_stopper(
-                    walls, state, target_robot, direction, size=size
-                )
-                if stopper is not None and stopper != target_robot:
-                    interaction_counts[stopper] += 1
-                    if first_helper_id is None:
-                        first_helper_id = stopper
-                        # helper location at the time of interaction (current state)
-                        hr, hc = int(state[stopper, 0]), int(state[stopper, 1])
-                        first_helper_cell = cell_id(hr, hc, size=size)
-                # advance state
-                state = next_state
-            else:
-                # apply other robot action without needing stopper info
-                next_state, moved, stopper = slide_and_get_stopper(
-                    walls, state, rid, direction, size=size
-                )
-                state = next_state
+            dir_idx = action_dir_idx(a)
+            dr, dc = DRDC[dir_idx]
 
-        # choose best helper
-        best_id = None
-        best_ct = -1
+            s_before = states[t]
+            s_after = states[t + 1]
+
+            # target final position after sliding
+            tr, tc = int(s_after[target_robot, 0]), int(s_after[target_robot, 1])
+            front = (tr + dr, tc + dc)
+
+            # if front cell is occupied by some other robot in s_before => blocked by that robot
+            for r in range(4):
+                if r == target_robot:
+                    continue
+                rr, rc = int(s_before[r, 0]), int(s_before[r, 1])
+                if (rr, rc) == front:
+                    counts[r] += 1
+                    if first_block_pos[r] is None:
+                        first_block_pos[r] = (rr, rc)
+                    break
+
+        # choose helper with max interaction
+        best_r = None
+        best_c = 0
         for r in range(4):
             if r == target_robot:
                 continue
-            if interaction_counts[r] > best_ct:
-                best_ct = interaction_counts[r]
-                best_id = r
+            if counts[r] > best_c:
+                best_c = counts[r]
+                best_r = r
 
-        found = (best_ct > 0)
-        if not found:
+        if best_r is None or best_c == 0:
             # fallback: deterministic non-target
-            best_id = (target_robot + 1) % 4
-            # fallback cell label: its position at s_i (or could use midpoint; your choice)
-            hr, hc = int(s_i[best_id, 0]), int(s_i[best_id, 1])
-            first_helper_cell = cell_id(hr, hc, size=size)
+            best_r = (target_robot + 1) % 4
+            # fallback label position = midpoint position (keeps labels stable)
+            s_mid = states[(i + j) // 2]
+            hr, hc = int(s_mid[best_r, 0]), int(s_mid[best_r, 1])
+            return best_r, (hr, hc)
 
+        # helper cell = helper position at FIRST interaction
+        hr, hc = first_block_pos[best_r]
+        return best_r, (int(hr), int(hc))
+
+    def _generate_pairs(self, T, pairs_per_episode, include_all_one_step, max_pairs_cap):
+        pairs = []
+
+        if pairs_per_episode is None:
+            # COMPLETE SUBSETS
+            for i in range(0, T - 1):
+                for j in range(i + 1, T):
+                    pairs.append((i, j))
         else:
-            # if we found interactions but first_helper_cell is None (shouldn't happen), fallback
-            if first_helper_cell is None:
-                hr, hc = int(s_i[best_id, 0]), int(s_i[best_id, 1])
-                first_helper_cell = cell_id(hr, hc, size=size)
+            # sampled subsets
+            for _ in range(pairs_per_episode):
+                i = random.randint(0, T - 2)
+                j = random.randint(i + 1, T - 1)
+                pairs.append((i, j))
 
-        return best_id, int(first_helper_cell), found
+        if include_all_one_step:
+            for i in range(0, T - 1):
+                pairs.append((i, i + 1))
 
-    def _generate_data(self, num_episodes, rollout_len, pairs_per_episode):
+        # de-dup
+        pairs = list(set(pairs))
+
+        # optional cap to avoid explosion (complete subsets can be large if rollout_len grows)
+        if max_pairs_cap is not None and len(pairs) > max_pairs_cap:
+            pairs = random.sample(pairs, max_pairs_cap)
+
+        return pairs
+
+    def _generate_data(self, num_episodes, rollout_len, pairs_per_episode, include_all_one_step, max_pairs_cap):
         for _ in range(num_episodes):
             self.env.generate_random_board()
             walls = self.env.walls.copy()
@@ -168,31 +176,22 @@ class HindsightDataset(Dataset):
             if T < 4:
                 continue
 
-            for _p in range(pairs_per_episode):
-                i = random.randint(0, T - 2)
-                j = random.randint(i + 1, T - 1)
-                k = (i + j) // 2
+            pairs = self._generate_pairs(T, pairs_per_episode, include_all_one_step, max_pairs_cap)
 
+            for (i, j) in pairs:
+                k = (i + j) // 2
                 s_i = states[i]
                 s_j = states[j]
                 s_k = states[k]
 
-                # Choose target robot and define goal as its final cell at s_j
                 target_robot = random.randint(0, 3)
                 goal_flat = np.array([target_robot, s_j[target_robot, 0], s_j[target_robot, 1]], dtype=np.int64)
 
-                # Target label: midpoint cell for target robot (unchanged)
                 mid_cell = cell_id(s_k[target_robot, 0], s_k[target_robot, 1], self.grid_size)
 
-                # Segment actions corresponding to s_i -> s_j
-                actions_segment = actions[i:j]
+                helper_id, (hr, hc) = self._helper_by_interaction(states, actions, i, j - 1, target_robot)
+                helper_cell = cell_id(hr, hc, self.grid_size)
 
-                # Helper labels: interaction-based + first-interaction cell
-                helper_id, helper_cell, _found = self._choose_helper_by_interaction(
-                    walls, s_i, actions_segment, target_robot, size=self.grid_size
-                )
-
-                # Verifier label: rollout distance bin
                 dist = j - i
                 dist_bin = dist if dist < DMAX else DMAX
 
@@ -201,10 +200,10 @@ class HindsightDataset(Dataset):
                     "robots_a": s_i,
                     "robots_b": s_j,
                     "goal": goal_flat,
-                    "mid_cell": int(mid_cell),
-                    "helper_id": int(helper_id),
-                    "helper_cell": int(helper_cell),
-                    "dist": int(dist_bin),
+                    "mid_cell": mid_cell,
+                    "helper_id": helper_id,
+                    "helper_cell": helper_cell,
+                    "dist": dist_bin,
                 })
 
     def __len__(self):
@@ -218,7 +217,7 @@ class HindsightDataset(Dataset):
             "final_robots": torch.tensor(d["robots_b"], dtype=torch.long),
             "goal": torch.tensor(d["goal"], dtype=torch.long),
             "mid_cell": torch.tensor(d["mid_cell"], dtype=torch.long),
-            "helper_id": torch.tensor(d["helper_id"], dtype=torch.long),
-            "helper_cell": torch.tensor(d["helper_cell"], dtype=torch.long),
+            "block_id": torch.tensor(d["helper_id"], dtype=torch.long),
+            "block_cell": torch.tensor(d["helper_cell"], dtype=torch.long),
             "dist": torch.tensor(d["dist"], dtype=torch.long),
         }
