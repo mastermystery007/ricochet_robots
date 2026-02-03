@@ -71,11 +71,28 @@ def slide_and_get_stopper(walls, state_rc, robot_id, direction, size=16):
 
 
 class HindsightDataset(Dataset):
-    def __init__(self, env, num_episodes=1000, rollout_len=15, pairs_per_episode=6, grid_size=16):
+    def __init__(
+        self,
+        env,
+        num_episodes=1000,
+        rollout_len=15,
+        max_pairs_per_episode=1000,
+        min_seg_len=1,
+        max_seg_len=None,
+        grid_size=16,
+    ):
         self.env = env
         self.grid_size = grid_size
         self.data = []
-        self._generate_data(num_episodes, rollout_len, pairs_per_episode)
+        self.total_pairs = 0
+        self.episodes = 0
+        self._generate_data(
+            num_episodes,
+            rollout_len,
+            max_pairs_per_episode,
+            min_seg_len,
+            max_seg_len,
+        )
 
     def _random_walk_episode(self, steps=15):
         states = [self.env.get_state()]
@@ -101,8 +118,7 @@ class HindsightDataset(Dataset):
         Returns: (helper_id, helper_cell_id, found_interaction_bool)
         """
         interaction_counts = [0, 0, 0, 0]
-        first_helper_cell = None
-        first_helper_id = None
+        first_pos = {0: None, 1: None, 2: None, 3: None}
 
         # simulate forward from s_i applying the actions in the segment
         state = s_i.copy()
@@ -118,11 +134,9 @@ class HindsightDataset(Dataset):
                 )
                 if stopper is not None and stopper != target_robot:
                     interaction_counts[stopper] += 1
-                    if first_helper_id is None:
-                        first_helper_id = stopper
-                        # helper location at the time of interaction (current state)
+                    if first_pos[stopper] is None:
                         hr, hc = int(state[stopper, 0]), int(state[stopper, 1])
-                        first_helper_cell = cell_id(hr, hc, size=size)
+                        first_pos[stopper] = cell_id(hr, hc, size=size)
                 # advance state
                 state = next_state
             else:
@@ -146,19 +160,17 @@ class HindsightDataset(Dataset):
         if not found:
             # fallback: deterministic non-target
             best_id = (target_robot + 1) % 4
-            # fallback cell label: its position at s_i (or could use midpoint; your choice)
-            hr, hc = int(s_i[best_id, 0]), int(s_i[best_id, 1])
-            first_helper_cell = cell_id(hr, hc, size=size)
+            first_helper_cell = None
 
         else:
-            # if we found interactions but first_helper_cell is None (shouldn't happen), fallback
+            first_helper_cell = first_pos[best_id]
             if first_helper_cell is None:
                 hr, hc = int(s_i[best_id, 0]), int(s_i[best_id, 1])
                 first_helper_cell = cell_id(hr, hc, size=size)
 
         return best_id, int(first_helper_cell), found
 
-    def _generate_data(self, num_episodes, rollout_len, pairs_per_episode):
+    def _generate_data(self, num_episodes, rollout_len, max_pairs_per_episode, min_seg_len, max_seg_len):
         for _ in range(num_episodes):
             self.env.generate_random_board()
             walls = self.env.walls.copy()
@@ -168,9 +180,24 @@ class HindsightDataset(Dataset):
             if T < 4:
                 continue
 
-            for _p in range(pairs_per_episode):
-                i = random.randint(0, T - 2)
-                j = random.randint(i + 1, T - 1)
+            max_len = (T - 1) if max_seg_len is None else min(max_seg_len, T - 1)
+            seg_pairs = []
+            for i in range(0, T - 1):
+                for j in range(i + min_seg_len, T):
+                    seg_len = j - i
+                    if seg_len < min_seg_len:
+                        continue
+                    if seg_len > max_len:
+                        continue
+                    seg_pairs.append((i, j))
+
+            if not seg_pairs:
+                continue
+
+            if len(seg_pairs) > max_pairs_per_episode:
+                seg_pairs = random.sample(seg_pairs, max_pairs_per_episode)
+
+            for i, j in seg_pairs:
                 k = (i + j) // 2
 
                 s_i = states[i]
@@ -181,16 +208,19 @@ class HindsightDataset(Dataset):
                 target_robot = random.randint(0, 3)
                 goal_flat = np.array([target_robot, s_j[target_robot, 0], s_j[target_robot, 1]], dtype=np.int64)
 
-                # Target label: midpoint cell for target robot (unchanged)
-                mid_cell = cell_id(s_k[target_robot, 0], s_k[target_robot, 1], self.grid_size)
-
                 # Segment actions corresponding to s_i -> s_j
                 actions_segment = actions[i:j]
 
+                # Target label: midpoint cell for target robot (unchanged)
+                mid_cell = cell_id(s_k[target_robot, 0], s_k[target_robot, 1], self.grid_size)
+
                 # Helper labels: interaction-based + first-interaction cell
-                helper_id, helper_cell, _found = self._choose_helper_by_interaction(
+                helper_id, helper_cell, found = self._choose_helper_by_interaction(
                     walls, s_i, actions_segment, target_robot, size=self.grid_size
                 )
+                if not found:
+                    hr, hc = int(s_k[helper_id, 0]), int(s_k[helper_id, 1])
+                    helper_cell = cell_id(hr, hc, size=self.grid_size)
 
                 # Verifier label: rollout distance bin
                 dist = j - i
@@ -206,6 +236,9 @@ class HindsightDataset(Dataset):
                     "helper_cell": int(helper_cell),
                     "dist": int(dist_bin),
                 })
+
+            self.total_pairs += len(seg_pairs)
+            self.episodes += 1
 
     def __len__(self):
         return len(self.data)
